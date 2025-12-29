@@ -202,11 +202,13 @@
 
       // 2) Static axle loads
       const g = 9.81;
-      const FzFrontStatic = this.m * g * (this.b / this.L);
-      const FzRearStatic  = this.m * g * (this.a / this.L);
+      const gripScale = 1.6;   // <-- this is the magic asphalt anchor
+      const FzFrontStatic = this.m * g * gripScale * (this.b / this.L);
+      const FzRearStatic  = this.m * g * gripScale * (this.a / this.L);
+
 
       // 3) Estimate effective mu reduction with lateral accel (cheap load sensitivity)
-      const loadSensitivity = 0.14; // 0.10–0.20
+      const loadSensitivity = 0.05; // 0.10–0.20
      const speed = Math.abs(this.vx);
       let muBoost = 1.0;
       
