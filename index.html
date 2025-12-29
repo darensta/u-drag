@@ -90,8 +90,8 @@
       track: 1.58,             // m (approx)
 
       // Tires / grip (performance street)
-      mu_peak: 1.05,
-      mu_slide: 0.85,          // sliding grip fraction (lower = more “falls into” slides)
+      mu_peak: 1.25,
+      mu_slide: 0.98,         // sliding grip fraction (lower = more “falls into” slides)
 
       // Lateral stiffness (game-tuned range; higher = snappier response)
       C_alpha_front: 140000,
@@ -203,8 +203,11 @@
       // 2) Static axle loads
       const g = 9.81;
       const gripScale = 1.6;   // <-- this is the magic asphalt anchor
+      const gripScale = 2.2;   // THIS is the asphalt anchor
+
       const FzFrontStatic = this.m * g * gripScale * (this.b / this.L);
       const FzRearStatic  = this.m * g * gripScale * (this.a / this.L);
+
 
 
       // 3) Estimate effective mu reduction with lateral accel (cheap load sensitivity)
@@ -275,7 +278,7 @@
         const used = Math.hypot(Fx_req, Fy);
         const slip = used / Math.max(capPeak, 1e-6);
 
-        const cap = (slip > 1.0) ? (muEff * this.muSlide * FzAxle) : capPeak;
+        const cap = (slip > 1.12) ? (muEff * this.muSlide * FzAxle) : capPeak;
 
         if (used > cap) {
           const s = cap / used;
