@@ -101,11 +101,11 @@
       drive_type: "RWD",       // FWD / RWD / AWD
 
       // Power & brakes (forces, not horsepower)
-      engine_force: 8200,      // N (0–~30 mph shove; tune this for launch feel)
+      engine_force: 9800,      // N (0–~30 mph shove; tune this for launch feel)
       brake_g: 1.10,           // max braking decel in g
 
       // Steering
-      steer_max_deg: 38,       // normal car ~32–45°, drift car >55°
+      steer_max_deg: 44,       // normal car ~32–45°, drift car >55°
       steer_response: 13,      // 1/s steering smoothing
 
       // Resistances
@@ -206,8 +206,15 @@
 
       // 3) Estimate effective mu reduction with lateral accel (cheap load sensitivity)
       const loadSensitivity = 0.14; // 0.10–0.20
-      const muEff = clamp(this.muPeak * (1 - loadSensitivity * Math.abs(this.lastAy)/g),
-                          0.55 * this.muPeak, this.muPeak);
+     const speed = Math.abs(this.vx);
+      let muBoost = 1.0;
+      
+      if (speed < 8) muBoost = 1.35;
+      else if (speed < 15) muBoost = 1.20;
+      else if (speed < 25) muBoost = 1.08;
+      
+      const muEff = this.muPeak * muBoost;
+
 
       // 4) Weight transfer (longitudinal)
       // Use lastAx from previous step; good enough + stable
@@ -298,6 +305,11 @@
       this.vy += ay * dt;
       this.r  += rdot * dt;
       this.psi += this.r * dt;
+
+      // Gentle yaw self-stability (keeps control smooth but still allows spins)
+      const stability = 0.06;   // 0.04–0.10
+      this.r -= this.r * stability * dt;
+
 
       // World position integrate
       const c = Math.cos(this.psi), s = Math.sin(this.psi);
