@@ -190,12 +190,12 @@
     step(dt, input) {
       // 1) Smooth inputs
       const steerCmd = clamp(input.steer, -1, 1) * this.steerMax;
-      const alphaSteer = 1 - Math.exp(-this.steerResp * dt);
+      const alphaSteer = 1 - Math.exp(-(this.steerResp * 2.2) * dt);
       this.delta += (steerCmd - this.delta) * alphaSteer;
 
       // Throttle/brake smoothing
-      this.throttle = lerp(this.throttle, clamp(input.throttle, 0, 1), 0.10);
-      this.brake    = lerp(this.brake,    clamp(input.brake,    0, 1), 0.12);
+      this.throttle = lerp(this.throttle, clamp(input.throttle,0,1), 0.25);
+      this.brake    = lerp(this.brake,    clamp(input.brake,   0,1), 0.35);
 
       const eps = 0.5; // m/s (avoid divide-by-zero weirdness)
 
@@ -467,7 +467,7 @@
       this.ctx = canvas.getContext('2d', { alpha: false });
 
       // Angled camera: squash Y to simulate “tilt”
-      this.yScale = 0.62; // 0.55–0.75
+      this.yScale = 0.70; // 0.55–0.75
       this.zoom = 26;     // pixels per meter
 
       this.resize();
