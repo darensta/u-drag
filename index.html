@@ -94,8 +94,9 @@
       mu_slide: 0.85,          // sliding grip fraction (lower = more “falls into” slides)
 
       // Lateral stiffness (game-tuned range; higher = snappier response)
-      C_alpha_front: 90000,    // N/rad
-      C_alpha_rear:  85000,    // N/rad
+      C_alpha_front: 140000,
+      C_alpha_rear:  130000,
+
 
       // Drivetrain
       drive_type: "RWD",       // FWD / RWD / AWD
@@ -233,8 +234,9 @@
       const alphaR = Math.atan2(vyr, Math.max(Math.abs(vxr), eps));
 
       // 7) Lateral forces (smooth saturation)
-      let FyF = -this.Caf * Math.tanh(alphaF);
-      let FyR = -this.Car * Math.tanh(alphaR);
+      let FyF = -this.Caf * Math.tanh(alphaF * 1.6);
+      let FyR = -this.Car * Math.tanh(alphaR * 1.6);
+
 
       // Cap lateral by peak friction
       const FyFmax = muEff * FzFront;
