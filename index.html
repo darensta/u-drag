@@ -1,0 +1,749 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>U-Turn Drag — v1</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #0b0f14; overflow: hidden; }
+    canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+
+    /* Simple HUD */
+    #hud {
+      position: fixed; left: 12px; top: 12px;
+      font: 14px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      color: #d7e3f4;
+      background: rgba(0,0,0,0.35);
+      padding: 10px 12px; border-radius: 10px;
+      backdrop-filter: blur(6px);
+      user-select: none;
+    }
+    #hud b { color: #fff; }
+    #hud .dim { color:#9bb0c7; font-size: 12px; }
+
+    /* Mobile touch zones overlays (invisible but debuggable if you add background) */
+    .zone {
+      position: fixed; top: 0; bottom: 0;
+      width: 50vw;
+      /* background: rgba(255,255,255,0.03); */ /* uncomment to visualize */
+      pointer-events: none;
+    }
+    #zoneLeft { left: 0; }
+    #zoneRight { right: 0; }
+
+    /* Optional on-screen control hints */
+    #touchHint {
+      position: fixed; left: 12px; bottom: 12px;
+      font: 12px system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      color: #9bb0c7;
+      background: rgba(0,0,0,0.35);
+      padding: 8px 10px; border-radius: 10px;
+      backdrop-filter: blur(6px);
+      user-select: none;
+      max-width: 70vw;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+
+  <div id="hud">
+    <div><b id="carName"></b></div>
+    <div class="dim">Desktop: W throttle, S brake, mouse steer, R reset</div>
+    <div class="dim">Mobile: left half steer, right half throttle/brake (auto-center)</div>
+    <div style="margin-top:6px">
+      Speed: <span id="speed">0</span> mph ·
+      Slip F/R: <span id="slip">0.00 / 0.00</span>
+    </div>
+  </div>
+
+  <div id="touchHint">Tip: For the U-turn, brake while turning (trail brake), then feed throttle on exit.</div>
+  <div id="zoneLeft" class="zone"></div>
+  <div id="zoneRight" class="zone"></div>
+
+<script>
+(() => {
+  // ----------------------------
+  // Utilities
+  // ----------------------------
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const sign = (v) => (v < 0 ? -1 : (v > 0 ? 1 : 0));
+  const lerp = (a, b, t) => a + (b - a) * t;
+
+  // ----------------------------
+  // Vehicle database (data-driven)
+  // ----------------------------
+  const Vehicles = [
+    {
+      id: "2020_ford_mustang_gt",
+      make: "Ford",
+      model: "Mustang",
+      year: 2020,
+      trim: "GT",
+      display_name: "2020 Ford Mustang GT",
+
+      // Physical mass & geometry
+      mass: 1680,              // kg (curb-ish, game-approx)
+      wheelbase: 2.72,         // m
+      cg_to_front: 1.25,       // m (approx)
+      cg_height: 0.52,         // m (approx)
+      track: 1.58,             // m (approx)
+
+      // Tires / grip (performance street)
+      mu_peak: 1.05,
+      mu_slide: 0.85,          // sliding grip fraction (lower = more “falls into” slides)
+
+      // Lateral stiffness (game-tuned range; higher = snappier response)
+      C_alpha_front: 90000,    // N/rad
+      C_alpha_rear:  85000,    // N/rad
+
+      // Drivetrain
+      drive_type: "RWD",       // FWD / RWD / AWD
+
+      // Power & brakes (forces, not horsepower)
+      engine_force: 8200,      // N (0–~30 mph shove; tune this for launch feel)
+      brake_g: 1.10,           // max braking decel in g
+
+      // Steering
+      steer_max_deg: 38,       // normal car ~32–45°, drift car >55°
+      steer_response: 13,      // 1/s steering smoothing
+
+      // Resistances
+      aero_drag: 0.55,         // quadratic-ish coefficient
+      rolling_resistance: 0.014
+    }
+  ];
+
+  // ----------------------------
+  // Core physics: bicycle model + traction circle + weight transfer
+  // ----------------------------
+  class CarSim {
+    constructor(vehicle) {
+      this.setVehicle(vehicle);
+      this.reset();
+    }
+
+    setVehicle(v) {
+      this.v = v;
+      this.m = v.mass;
+      this.L = v.wheelbase;
+      this.a = v.cg_to_front;
+      this.b = this.L - this.a;
+      this.h = v.cg_height;
+      this.track = v.track;
+      this.Iz = 0.25 * this.m * this.L * this.L; // decent approximation
+      this.steerMax = (v.steer_max_deg * Math.PI) / 180;
+      this.steerResp = v.steer_response;
+
+      this.muPeak = v.mu_peak;
+      this.muSlide = v.mu_slide;
+
+      this.Caf = v.C_alpha_front;
+      this.Car = v.C_alpha_rear;
+
+      this.drive = v.drive_type;
+
+      this.FdriveMax = v.engine_force;
+      this.FbrakeMax = this.m * 9.81 * v.brake_g;
+
+      this.aero = v.aero_drag;
+      this.rr = v.rolling_resistance;
+    }
+
+    reset() {
+      // World state
+      this.x = 0; this.y = 0;
+      this.psi = 0;      // heading
+      this.r = 0;        // yaw rate
+
+      // Body-frame velocities
+      this.vx = 0;       // long
+      this.vy = 0;       // lat
+
+      // Inputs (filtered)
+      this.delta = 0;
+      this.throttle = 0;
+      this.brake = 0;
+
+      // Diagnostics
+      this.slipFront = 0;
+      this.slipRear = 0;
+
+      // For weight-transfer estimate
+      this.lastAx = 0;
+      this.lastAy = 0;
+    }
+
+    // Export render snapshot (pure data)
+    snapshot() {
+      return {
+        x: this.x, y: this.y, psi: this.psi,
+        vx: this.vx, vy: this.vy,
+        speed: Math.hypot(this.vx, this.vy),
+        slipFront: this.slipFront,
+        slipRear: this.slipRear,
+        a: this.a,
+        b: this.b
+      };
+    }
+
+    step(dt, input) {
+      // 1) Smooth inputs
+      const steerCmd = clamp(input.steer, -1, 1) * this.steerMax;
+      const alphaSteer = 1 - Math.exp(-this.steerResp * dt);
+      this.delta += (steerCmd - this.delta) * alphaSteer;
+
+      // Throttle/brake smoothing
+      this.throttle = lerp(this.throttle, clamp(input.throttle, 0, 1), 0.10);
+      this.brake    = lerp(this.brake,    clamp(input.brake,    0, 1), 0.12);
+
+      const eps = 0.5; // m/s (avoid divide-by-zero weirdness)
+
+      // 2) Static axle loads
+      const g = 9.81;
+      const FzFrontStatic = this.m * g * (this.b / this.L);
+      const FzRearStatic  = this.m * g * (this.a / this.L);
+
+      // 3) Estimate effective mu reduction with lateral accel (cheap load sensitivity)
+      const loadSensitivity = 0.14; // 0.10–0.20
+      const muEff = clamp(this.muPeak * (1 - loadSensitivity * Math.abs(this.lastAy)/g),
+                          0.55 * this.muPeak, this.muPeak);
+
+      // 4) Weight transfer (longitudinal)
+      // Use lastAx from previous step; good enough + stable
+      const dFzLong = (this.m * this.lastAx * this.h) / this.L;
+      const FzFront = FzFrontStatic + dFzLong;
+      const FzRear  = FzRearStatic  - dFzLong;
+
+      // 5) Axle velocities in body frame
+      const vxf = this.vx;
+      const vyf = this.vy + this.a * this.r;
+      const vxr = this.vx;
+      const vyr = this.vy - this.b * this.r;
+
+      // 6) Slip angles
+      const alphaF = Math.atan2(vyf, Math.max(Math.abs(vxf), eps)) - this.delta;
+      const alphaR = Math.atan2(vyr, Math.max(Math.abs(vxr), eps));
+
+      // 7) Lateral forces (smooth saturation)
+      let FyF = -this.Caf * Math.tanh(alphaF);
+      let FyR = -this.Car * Math.tanh(alphaR);
+
+      // Cap lateral by peak friction
+      const FyFmax = muEff * FzFront;
+      const FyRmax = muEff * FzRear;
+      FyF = clamp(FyF, -FyFmax, FyFmax);
+      FyR = clamp(FyR, -FyRmax, FyRmax);
+
+      // 8) Longitudinal requested force (engine - brakes - resistances)
+      const Fdrive = this.throttle * this.FdriveMax;
+      const Fbrake = this.brake * this.FbrakeMax;
+
+      // Basic resistances in body frame
+      const drag = -this.aero * this.vx * Math.abs(this.vx);
+      const rr   = -this.rr * this.m * g * sign(this.vx);
+
+      const FxReqTotal = (Fdrive - Fbrake) + drag + rr;
+
+      let FxF_req = 0, FxR_req = 0;
+      if (this.drive === "FWD") {
+        FxF_req = FxReqTotal;
+      } else if (this.drive === "RWD") {
+        FxR_req = FxReqTotal;
+      } else { // AWD
+        FxF_req = 0.5 * FxReqTotal;
+        FxR_req = 0.5 * FxReqTotal;
+      }
+
+      // 9) Traction circle clamp per axle (combined grip)
+      // Use peak cap for "detection" but sliding mu for post-break feel:
+      // We'll clamp to muEff*Fz but once you exceed 1.0 slip, we “drop” to muSlide.
+      // Simple approach: compute slip on peak, then optionally scale down capacity.
+      const clampAxle = (Fx_req, Fy, FzAxle) => {
+        const capPeak = muEff * FzAxle;
+        const used = Math.hypot(Fx_req, Fy);
+        const slip = used / Math.max(capPeak, 1e-6);
+
+        const cap = (slip > 1.0) ? (muEff * this.muSlide * FzAxle) : capPeak;
+
+        if (used > cap) {
+          const s = cap / used;
+          return { Fx: Fx_req * s, Fy: Fy * s, slip: used / Math.max(capPeak, 1e-6) };
+        }
+        return { Fx: Fx_req, Fy, slip };
+      };
+
+      const front = clampAxle(FxF_req, FyF, FzFront);
+      const rear  = clampAxle(FxR_req, FyR, FzRear);
+
+      const FxF = front.Fx, FyF2 = front.Fy;
+      const FxR = rear.Fx,  FyR2 = rear.Fy;
+
+      this.slipFront = front.slip;
+      this.slipRear  = rear.slip;
+
+      // 10) Sum forces + yaw moment
+      const Fx = FxF + FxR;
+      const Fy = FyF2 + FyR2;
+
+      const Mz = this.a * FyF2 - this.b * FyR2;
+
+      // 11) Accelerations in body frame
+      const ax = Fx / this.m + this.r * this.vy;
+      const ay = Fy / this.m - this.r * this.vx;
+      const rdot = Mz / this.Iz;
+
+      // Integrate
+      this.vx += ax * dt;
+      this.vy += ay * dt;
+      this.r  += rdot * dt;
+      this.psi += this.r * dt;
+
+      // World position integrate
+      const c = Math.cos(this.psi), s = Math.sin(this.psi);
+      const vxw = c * this.vx - s * this.vy;
+      const vyw = s * this.vx + c * this.vy;
+      this.x += vxw * dt;
+      this.y += vyw * dt;
+
+      // Save for next step (weight transfer estimate)
+      this.lastAx = ax;
+      this.lastAy = ay;
+    }
+  }
+
+  // ----------------------------
+  // Skid system (segments)
+  // ----------------------------
+  class SkidSystem {
+    constructor() { this.segs = []; }
+
+    static skidLevel(slip) {
+      if (slip < 0.85) return 0; // clean
+      if (slip < 1.00) return 1; // scrub
+      if (slip < 1.15) return 2; // skid
+      return 3;                  // full slide
+    }
+
+    add(x1, y1, x2, y2, intensity) {
+      this.segs.push({ x1, y1, x2, y2, life: 1.0, intensity });
+      if (this.segs.length > 2200) this.segs.splice(0, this.segs.length - 2200);
+    }
+
+    update(dt) {
+      const fadeRate = 0.045; // lower = longer lasting
+      for (const s of this.segs) s.life -= dt * fadeRate;
+      this.segs = this.segs.filter(s => s.life > 0);
+    }
+  }
+
+  // ----------------------------
+  // Input handling (desktop + mobile)
+  // ----------------------------
+  class InputSystem {
+    constructor(canvas) {
+      this.canvas = canvas;
+
+      // Raw inputs
+      this.keyW = false;
+      this.keyS = false;
+
+      // Steering: desktop mouse mode
+      this.mouseSteer = 0; // [-1..1]
+      this.mouseActive = false;
+
+      // Mobile touch controls
+      this.isTouch = false;
+      this.touchSteer = 0;     // [-1..1]
+      this.touchTB = 0;        // [-1..1] + throttle, - brake (auto-centers)
+      this.leftTouchId = null;
+      this.rightTouchId = null;
+      this.leftOrigin = null;
+      this.rightOrigin = null;
+
+      this._bind();
+    }
+
+    _bind() {
+      // Keyboard
+      window.addEventListener('keydown', (e) => {
+        if (e.code === 'KeyW') this.keyW = true;
+        if (e.code === 'KeyS') this.keyS = true;
+      });
+      window.addEventListener('keyup', (e) => {
+        if (e.code === 'KeyW') this.keyW = false;
+        if (e.code === 'KeyS') this.keyS = false;
+      });
+
+      // Mouse steering (relative to canvas center)
+      window.addEventListener('mousemove', (e) => {
+        if (this.isTouch) return;
+        const rect = this.canvas.getBoundingClientRect();
+        const cx = rect.left + rect.width * 0.5;
+        const dx = (e.clientX - cx) / (rect.width * 0.35);
+        this.mouseSteer = clamp(dx, -1, 1);
+        this.mouseActive = true;
+      });
+
+      // Touch zones
+      this.canvas.addEventListener('pointerdown', (e) => {
+        if (e.pointerType !== 'touch') return;
+        this.isTouch = true;
+
+        const rect = this.canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const isLeft = x < rect.width * 0.5;
+
+        if (isLeft && this.leftTouchId === null) {
+          this.leftTouchId = e.pointerId;
+          this.leftOrigin = { x: e.clientX, y: e.clientY };
+        } else if (!isLeft && this.rightTouchId === null) {
+          this.rightTouchId = e.pointerId;
+          this.rightOrigin = { x: e.clientX, y: e.clientY };
+        }
+        this.canvas.setPointerCapture(e.pointerId);
+      });
+
+      this.canvas.addEventListener('pointermove', (e) => {
+        if (!this.isTouch) return;
+
+        const curve = (v) => sign(v) * Math.pow(Math.abs(v), 1.4); // soften center
+
+        if (e.pointerId === this.leftTouchId && this.leftOrigin) {
+          const dx = (e.clientX - this.leftOrigin.x) / 140;
+          this.touchSteer = clamp(curve(clamp(dx, -1, 1)), -1, 1);
+        }
+
+        if (e.pointerId === this.rightTouchId && this.rightOrigin) {
+          // Up = throttle (+), down = brake (-)
+          const dy = (this.rightOrigin.y - e.clientY) / 170;
+          this.touchTB = clamp(curve(clamp(dy, -1, 1)), -1, 1);
+        }
+      });
+
+      const endTouch = (e) => {
+        if (e.pointerId === this.leftTouchId) {
+          this.leftTouchId = null;
+          this.leftOrigin = null;
+          this.touchSteer = 0; // auto-center steer
+        }
+        if (e.pointerId === this.rightTouchId) {
+          this.rightTouchId = null;
+          this.rightOrigin = null;
+          this.touchTB = 0; // auto-center throttle/brake to coast
+        }
+      };
+
+      this.canvas.addEventListener('pointerup', endTouch);
+      this.canvas.addEventListener('pointercancel', endTouch);
+    }
+
+    // Returns command inputs for physics step
+    sample() {
+      // Steering: touch wins if active, else mouse
+      const steer = this.isTouch ? this.touchSteer : (this.mouseActive ? this.mouseSteer : 0);
+
+      // Throttle/brake: touch right slider or W/S
+      let throttle = 0, brake = 0;
+
+      if (this.isTouch) {
+        throttle = Math.max(0, this.touchTB);
+        brake    = Math.max(0, -this.touchTB);
+      } else {
+        throttle = this.keyW ? 1 : 0;
+        brake    = this.keyS ? 1 : 0;
+      }
+
+      return { steer, throttle, brake };
+    }
+  }
+
+  // ----------------------------
+  // Renderer: Canvas2D angled top-down (¾ view)
+  // ----------------------------
+  class Canvas2DRenderer {
+    constructor(canvas) {
+      this.canvas = canvas;
+      this.ctx = canvas.getContext('2d', { alpha: false });
+
+      // Angled camera: squash Y to simulate “tilt”
+      this.yScale = 0.62; // 0.55–0.75
+      this.zoom = 26;     // pixels per meter
+
+      this.resize();
+      window.addEventListener('resize', () => this.resize());
+    }
+
+    resize() {
+      const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+      this.dpr = dpr;
+      this.canvas.width = Math.floor(innerWidth * dpr);
+      this.canvas.height = Math.floor(innerHeight * dpr);
+      this.canvas.style.width = innerWidth + "px";
+      this.canvas.style.height = innerHeight + "px";
+      this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+
+    worldToScreen(wx, wy, cam) {
+      // Camera is centered on car; angled effect by scaling Y
+      const dx = (wx - cam.x) * this.zoom;
+      const dy = (wy - cam.y) * this.zoom * this.yScale;
+      return {
+        x: innerWidth * 0.5 + dx,
+        y: innerHeight * 0.55 + dy
+      };
+    }
+
+    clear() {
+      this.ctx.fillStyle = "#0b0f14";
+      this.ctx.fillRect(0, 0, innerWidth, innerHeight);
+    }
+
+    drawCourse(cam) {
+      const ctx = this.ctx;
+
+      // Simple U-turn course: straight lane + hairpin + back
+      // World units: meters.
+      // You can replace this with real track geometry later.
+      ctx.save();
+
+      // Grid
+      ctx.globalAlpha = 0.25;
+      ctx.strokeStyle = "#1a2633";
+      ctx.lineWidth = 1;
+      const spacing = 10;
+      for (let i = -60; i <= 60; i += spacing) {
+        const p1 = this.worldToScreen(i, -80, cam);
+        const p2 = this.worldToScreen(i,  80, cam);
+        ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+      }
+      for (let j = -80; j <= 80; j += spacing) {
+        const p1 = this.worldToScreen(-60, j, cam);
+        const p2 = this.worldToScreen( 60, j, cam);
+        ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+      }
+      ctx.restore();
+
+      // Lane (just a “road ribbon”)
+      const roadW = 9; // m
+      const ctx2 = this.ctx;
+      ctx2.save();
+      ctx2.globalAlpha = 0.9;
+      ctx2.fillStyle = "#0f1822";
+
+      // Draw a simple shape in world coordinates by sampling points and converting
+      const roadPts = [];
+
+      // Straight out
+      for (let t = -60; t <= 40; t += 2) roadPts.push({x: 0, y: t});
+      // Hairpin arc (U-turn)
+      const R = 14;
+      for (let a = 0; a <= Math.PI; a += Math.PI/22) {
+        roadPts.push({ x: R*Math.sin(a), y: 40 + R*(1 - Math.cos(a)) });
+      }
+      // Straight back
+      for (let t = 40 + 2*R; t >= -60; t -= 2) roadPts.push({x: 2*R, y: t});
+
+      // Build a thick polyline ribbon (simple: draw circles + quads-ish via strokes)
+      ctx2.lineCap = "round";
+      ctx2.lineJoin = "round";
+      ctx2.strokeStyle = "#0f1822";
+      ctx2.lineWidth = roadW * this.zoom * this.yScale; // scaled width visually
+      ctx2.beginPath();
+      const p0 = this.worldToScreen(roadPts[0].x, roadPts[0].y, cam);
+      ctx2.moveTo(p0.x, p0.y);
+      for (let i = 1; i < roadPts.length; i++) {
+        const p = this.worldToScreen(roadPts[i].x, roadPts[i].y, cam);
+        ctx2.lineTo(p.x, p.y);
+      }
+      ctx2.stroke();
+
+      // Center line
+      ctx2.globalAlpha = 0.5;
+      ctx2.strokeStyle = "#2b3d52";
+      ctx2.lineWidth = 2;
+      ctx2.beginPath();
+      ctx2.moveTo(p0.x, p0.y);
+      for (let i = 1; i < roadPts.length; i++) {
+        const p = this.worldToScreen(roadPts[i].x, roadPts[i].y, cam);
+        ctx2.lineTo(p.x, p.y);
+      }
+      ctx2.stroke();
+
+      // Start line near origin
+      const s1 = this.worldToScreen(-4, -10, cam);
+      const s2 = this.worldToScreen( 4, -10, cam);
+      ctx2.globalAlpha = 0.9;
+      ctx2.strokeStyle = "#e6eef9";
+      ctx2.lineWidth = 3;
+      ctx2.beginPath(); ctx2.moveTo(s1.x, s1.y); ctx2.lineTo(s2.x, s2.y); ctx2.stroke();
+
+      ctx2.restore();
+    }
+
+    drawSkids(cam, skids) {
+      const ctx = this.ctx;
+      ctx.save();
+      for (const s of skids.segs) {
+        const p1 = this.worldToScreen(s.x1, s.y1, cam);
+        const p2 = this.worldToScreen(s.x2, s.y2, cam);
+        ctx.globalAlpha = clamp(s.life, 0, 1) * 0.8;
+        ctx.strokeStyle = "#070a0f";
+        ctx.lineWidth = (s.intensity === 3 ? 4 : 2);
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    drawCar(cam, snap) {
+      const ctx = this.ctx;
+      const c = Math.cos(snap.psi), s = Math.sin(snap.psi);
+
+      // Axle positions in world
+      const frontAx = { x: snap.x + c * snap.a, y: snap.y + s * snap.a };
+      const rearAx  = { x: snap.x - c * snap.b, y: snap.y - s * snap.b };
+
+      const center = this.worldToScreen(snap.x, snap.y, cam);
+
+      // Car body dimensions
+      const carLen = (snap.a + snap.b) * this.zoom * 1.15;
+      const carWid = 1.90 * this.zoom * this.yScale; // visual width scaled
+
+      ctx.save();
+      ctx.translate(center.x, center.y);
+      ctx.rotate(snap.psi);
+
+      // Body shadow
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = "#000";
+      ctx.fillRect(-carLen*0.5 + 3, -carWid*0.5 + 3, carLen, carWid);
+
+      // Body
+      ctx.globalAlpha = 0.95;
+      ctx.fillStyle = "#2c78ff";
+      ctx.fillRect(-carLen*0.5, -carWid*0.5, carLen, carWid);
+
+      // Hood stripe
+      ctx.globalAlpha = 0.25;
+      ctx.fillStyle = "#0b0f14";
+      ctx.fillRect(-carLen*0.1, -carWid*0.5, carLen*0.2, carWid);
+
+      // Nose indicator
+      ctx.globalAlpha = 0.9;
+      ctx.fillStyle = "#e6eef9";
+      ctx.fillRect(carLen*0.28, -carWid*0.12, carLen*0.10, carWid*0.24);
+
+      // Wheels (simple)
+      ctx.globalAlpha = 0.9;
+      ctx.fillStyle = "#0b0f14";
+      const wheelL = carLen * 0.18;
+      const wheelW = carWid * 0.22;
+      // front
+      ctx.fillRect(carLen*0.20, -carWid*0.47, wheelL, wheelW);
+      ctx.fillRect(carLen*0.20,  carWid*0.25, wheelL, wheelW);
+      // rear
+      ctx.fillRect(-carLen*0.38, -carWid*0.47, wheelL, wheelW);
+      ctx.fillRect(-carLen*0.38,  carWid*0.25, wheelL, wheelW);
+
+      ctx.restore();
+
+      return { frontAx, rearAx };
+    }
+
+    draw(cam, snap, skids) {
+      this.clear();
+      this.drawCourse(cam);
+      this.drawSkids(cam, skids);
+      const axles = this.drawCar(cam, snap);
+      return axles;
+    }
+  }
+
+  // ----------------------------
+  // Game glue
+  // ----------------------------
+  const canvas = document.getElementById('c');
+  const carNameEl = document.getElementById('carName');
+  const speedEl = document.getElementById('speed');
+  const slipEl = document.getElementById('slip');
+
+  const vehicle = Vehicles[0]; // Mustang GT start
+  carNameEl.textContent = vehicle.display_name;
+
+  const sim = new CarSim(vehicle);
+  const inputSys = new InputSystem(canvas);
+  const skids = new SkidSystem();
+  const renderer = new Canvas2DRenderer(canvas);
+
+  // Place car at start line facing "up"
+  sim.x = 0;
+  sim.y = -20;
+  sim.psi = Math.PI/2; // facing positive Y
+
+  // Reset key
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'KeyR') {
+      sim.reset();
+      sim.x = 0; sim.y = -20; sim.psi = Math.PI/2;
+      skids.segs.length = 0;
+    }
+  });
+
+  let lastT = performance.now();
+
+  function frame(t) {
+    const dtRaw = (t - lastT) / 1000;
+    lastT = t;
+
+    // Stable stepping (prevents big dt spikes)
+    const dt = clamp(dtRaw, 1/240, 1/30);
+
+    const cmd = inputSys.sample();
+
+    // Physics substeps improve stability during hard turns
+    const steps = (dt > 1/90) ? 2 : 1;
+    const h = dt / steps;
+
+    for (let i = 0; i < steps; i++) {
+      sim.step(h, cmd);
+
+      // Skid emission using slip levels and axle positions
+      const snap = sim.snapshot();
+      const skidF = SkidSystem.skidLevel(snap.slipFront);
+      const skidR = SkidSystem.skidLevel(snap.slipRear);
+
+      // Axle contact points (world)
+      const c = Math.cos(snap.psi), s = Math.sin(snap.psi);
+      const frontAx = { x: snap.x + c * snap.a, y: snap.y + s * snap.a };
+      const rearAx  = { x: snap.x - c * snap.b, y: snap.y - s * snap.b };
+
+      // Draw skid segments opposite to heading (short streaks)
+      const segLen = 0.35; // meters per tick (visual)
+      if (skidF >= 2) skids.add(frontAx.x, frontAx.y, frontAx.x - c*segLen, frontAx.y - s*segLen, skidF);
+      if (skidR >= 2) skids.add(rearAx.x,  rearAx.y,  rearAx.x  - c*segLen, rearAx.y  - s*segLen, skidR);
+    }
+
+    skids.update(dt);
+
+    // Camera centers on car
+    const snap = sim.snapshot();
+    const cam = { x: snap.x, y: snap.y };
+
+    renderer.draw(cam, snap, skids);
+
+    // HUD updates
+    const mph = snap.speed * 2.236936;
+    speedEl.textContent = mph.toFixed(1);
+    slipEl.textContent = `${snap.slipFront.toFixed(2)} / ${snap.slipRear.toFixed(2)}`;
+
+    requestAnimationFrame(frame);
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
